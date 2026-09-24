@@ -2,6 +2,13 @@
 ### tab/comma-delimited transcript file expected by punkst (pts2tiles,
 ### convert-dge, etc).
 #
+# Usage:
+#   python spatialdata_to_punkst.py \
+#     --sdata /path/to/data.zarr --points-key transcripts \
+#     --coordinate-system global --out transcripts.tsv
+# where --sdata is the SpatialData zarr store and --points-key names the
+# Points element inside it.
+#
 # The output has columns: x, y, feature[, count], preceded by a single
 # "#"-prefixed header line. pts2tiles auto-detects "#"-prefixed lines as
 # header/metadata, so no --skip is needed:
