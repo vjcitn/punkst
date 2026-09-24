@@ -19,6 +19,7 @@ def build(out_zarr, n_points=200, scale=2.0, seed=0):
             "gene": pd.Categorical(rng.choice(genes, n_points)),
         }
     )
+    df["qv"] = rng.uniform(0, 40, n_points)
 
     points = PointsModel.parse(df, coordinates={"x": "x", "y": "y"}, feature_key="gene")
     # Register two coordinate systems: the raw "pixels" space the data was

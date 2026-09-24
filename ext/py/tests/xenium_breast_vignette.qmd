@@ -1,0 +1,320 @@
+---
+title: "Pixel-level factor analysis of a Xenium breast cancer SpatialData store"
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+jupyter: python3
+execute:
+  warning: false
+---
+
+This vignette applies the SpatialData → punkst bridge to a real Xenium breast
+cancer section (about 42 million transcripts, a 313-gene panel) stored as a
+SpatialData zarr store. It runs the standard punkst workflow on the exported
+transcripts and asks whether the learned factors recover recognisable tissue
+compartments.
+
+Requirements:
+
+- A `spatialdata` new enough to read this store (**≥ 0.7**; the store is zarr v3).
+  Render with that environment's python, e.g.
+  `QUARTO_PYTHON=/path/to/venv/bin/python quarto render xenium_breast_vignette.qmd`.
+- A built `punkst` binary (`PUNKST=/path/to/bin/punkst`, default `<repo>/bin/punkst`).
+- The store, at `xenbrio1.zarr` next to this file (or set `XENIUM_ZARR`).
+- Optionally `PUNKST_WORKDIR=/some/dir` to keep intermediate files (about 2 GB)
+  so that re-rendering skips finished stages.
+
+## Setup
+
+```{python}
+import os, subprocess, sys, tempfile, time, warnings, io
+from pathlib import Path
+
+warnings.filterwarnings("ignore")
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+here = Path.cwd()
+sys.path.insert(0, str(here.parent))
+from spatialdata_to_punkst import convert
+
+zarr_path = Path(os.environ.get("XENIUM_ZARR", here / "xenbrio1.zarr"))
+punkst = Path(os.environ.get("PUNKST", here.parents[2] / "bin" / "punkst"))
+assert zarr_path.exists(), f"store not found: {zarr_path}"
+assert punkst.exists(), f"punkst binary not found: {punkst}; set PUNKST"
+work = Path(os.environ.get("PUNKST_WORKDIR") or tempfile.mkdtemp(prefix="punkst_xen_"))
+work.mkdir(parents=True, exist_ok=True)
+threads = min(8, os.cpu_count() or 1)
+
+def run(*args):
+    """Run a punkst subcommand, raising with its output on failure."""
+    t0 = time.time()
+    r = subprocess.run([str(punkst), *map(str, args)], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stdout + r.stderr)
+    print(f"{args[0]}: {time.time() - t0:.0f} s")
+
+print("store:", zarr_path)
+print("work dir:", work)
+```
+
+## 1. What is in the store?
+
+```{python}
+import spatialdata as sd
+from spatialdata.transformations import get_transformation
+
+sdata = sd.read_zarr(zarr_path)
+print(sdata)
+```
+
+The `transcripts` element holds one row per detected molecule, with a
+per-molecule quality score (`qv`) and the feature (gene or control probe) name.
+
+```{python}
+pts = sdata.points["transcripts"]
+print("rows:", f"{len(pts):,}")
+print("attrs:", pts.attrs["spatialdata_attrs"])
+pts.head()
+```
+
+## 2. Which coordinates does punkst need?
+
+punkst works in microns. The `transcripts` element is registered in a single
+coordinate system, `global`, through a scale transform. Exporting "the only
+coordinate system" would therefore silently change the units.
+
+```{python}
+t = get_transformation(pts, get_all=True)
+scale = float(t["global"].scale[0])
+um_per_px = 1 / scale
+print("transform into 'global':", t["global"])
+print(f"implied pixel size: {um_per_px:.4f} um / px")
+
+xmax_um = float(pts["x"].max().compute())
+scale0 = sdata.images["morphology_focus"]["scale0"]["image"]
+width_px = scale0.sizes["x"]
+print(f"max stored x: {xmax_um:,.0f}")
+print(f"image width:  {width_px:,} px  ->  {width_px * um_per_px:,.0f} um at {um_per_px:.4f} um/px")
+```
+
+The stored `x` maximum matches the image width *in microns*, so the stored
+(intrinsic) coordinates are microns and `global` is image pixels. We export with
+`--coordinate-system intrinsic`.
+
+## 3. Export transcripts
+
+We keep molecules with `qv ≥ 20`, the usual Xenium cut-off. Only `x`, `y` and the
+feature name are written; punkst's 2D workflow does not use `z`.
+
+```{python}
+tsv = work / "transcripts.tsv"
+if not tsv.exists():
+    t0 = time.time()
+    convert(str(zarr_path), "transcripts", str(tsv),
+            coordinate_system="intrinsic", min_qv=20)
+    print(f"converted in {time.time() - t0:.0f} s")
+
+n_kept = int(subprocess.run(["wc", "-l", str(tsv)], capture_output=True, text=True).stdout.split()[0]) - 1
+print(f"kept {n_kept:,} of {len(pts):,} transcripts ({100 * n_kept / len(pts):.1f}%) with qv >= 20")
+print(open(tsv).readline().rstrip(), "(header)")
+```
+
+## 4. `pts2tiles`
+
+```{python}
+prefix = work / "tiled"
+if not (work / "tiled.index").exists():
+    run("pts2tiles", "--in-tsv", tsv, "--icol-x", 0, "--icol-y", 1, "--icol-feature", 2,
+        "--tile-size", 500, "--temp-dir", work / "tmp1", "--threads", threads,
+        "--out-prefix", prefix)
+
+feat = pd.read_csv(work / "tiled.features.tsv", sep="\t", header=None, names=["feature", "count"])
+control_re = r"^(antisense_|NegControl|BLANK_|UnassignedCodeword)"
+is_ctrl = feat.feature.str.contains(control_re)
+print(f"{len(feat)} features: {(~is_ctrl).sum()} genes, {is_ctrl.sum()} control probes/codewords")
+print(f"control features hold {100 * feat['count'][is_ctrl].sum() / feat['count'].sum():.2f}% of transcripts")
+print(pd.read_csv(work / "tiled.coord_range.tsv", sep="\t", header=None, index_col=0)[1].to_dict())
+```
+
+## 5. `tiles2hex`
+
+Transcripts are pooled into non-overlapping hexagons with a 12 µm centre-to-centre
+spacing.
+
+```{python}
+if not (work / "hex_12.txt").exists():
+    run("tiles2hex", "--in-tsv", work / "tiled.tsv", "--in-index", work / "tiled.index",
+        "--feature-dict", work / "tiled.features.tsv",
+        "--icol-x", 0, "--icol-y", 1, "--icol-feature", 2,
+        "--hex-grid-dist", 12, "--min-count", 20,
+        "--out", work / "hex_12.txt", "--randomize", "--seed", 1,
+        "--temp-dir", work / "tmp2", "--threads", threads)
+
+cut = subprocess.run(["cut", "-f2,3,5", str(work / "hex_12.txt")], capture_output=True, text=True)
+hexdf = pd.read_csv(io.StringIO(cut.stdout), sep="\t", header=None, names=["x", "y", "total"])
+print(f"{len(hexdf):,} hexagons; median {hexdf.total.median():.0f} transcripts per hexagon")
+```
+
+The transcript density of the whole section, one point per hexagon:
+
+```{python}
+fig, ax = plt.subplots(figsize=(9, 6.6))
+sc = ax.scatter(hexdf.x, hexdf.y, c=np.log10(hexdf.total), s=1.6, marker="s",
+                linewidths=0, cmap="magma", rasterized=True)
+ax.set_aspect("equal"); ax.invert_yaxis()
+ax.set_xlabel("x (um)"); ax.set_ylabel("y (um)")
+fig.colorbar(sc, ax=ax, fraction=.035, label="log10 transcripts / hexagon")
+ax.set_title("Transcripts per 12 um hexagon")
+fig.tight_layout()
+```
+
+## 6. `topic-model`
+
+Twelve factors, with control probes excluded from the feature space.
+
+```{python}
+if not (work / "h12.k12.results.tsv").exists():
+    run("topic-model", "--in-data", work / "hex_12.txt", "--in-meta", work / "hex_12.json",
+        "--features", work / "tiled.features.tsv",
+        "--n-topics", 12, "--n-epochs", 2, "--sort-topics",
+        "--min-count-per-feature", 100, "--min-count-train", 20,
+        "--exclude-feature-regex", control_re,
+        "--out-prefix", work / "h12.k12", "--transform",
+        "--threads", threads, "--seed", 1)
+
+model = pd.read_csv(work / "h12.k12.model.tsv", sep="\t", index_col=0)
+res = pd.read_csv(work / "h12.k12.results.tsv", sep="\t").rename(columns={"#random_key": "key"})
+K = model.shape[1]
+print(f"model: {model.shape[0]} genes x {K} topics; results: {len(res):,} hexagons")
+assert K == 12 and len(res) > 100_000
+```
+
+### Interpreting the factors
+
+Each topic's top genes are those that are both abundant in the topic and specific
+to it. To name the topics we score each one against a small set of canonical
+marker genes for breast tissue compartments. This is a heuristic labelling for
+orientation only, computed from the fitted loadings so it does not depend on
+topic order.
+
+```{python}
+share = model.div(model.sum(axis=1), axis=0)      # fraction of each gene's mass in each topic
+within = model / model.sum()                       # P(gene | topic)
+markers = {
+    "tumor epithelium":   ["ERBB2", "KRT7", "EPCAM", "FOXA1", "GATA3", "KRT8"],
+    "fibroblast/stroma":  ["LUM", "POSTN", "PDGFRB", "PDGFRA", "MMP2", "CCDC80"],
+    "T cell":             ["CD3E", "TRAC", "IL7R", "CD8A", "CD3D", "CD2"],
+    "macrophage/myeloid": ["LYZ", "CD163", "CD68", "AIF1", "MRC1", "FCER1G"],
+    "endothelial":        ["VWF", "PECAM1", "AQP1", "CD93", "CLEC14A"],
+    "myoepithelial/SMC":  ["MYH11", "ACTA2", "KRT5", "KRT14", "MYLK"],
+    "plasma/B cell":      ["MZB1", "CD79A", "SLAMF7"],
+}
+markers = {k: [g for g in v if g in model.index] for k, v in markers.items()}
+score = pd.DataFrame({name: share.loc[genes].mean() for name, genes in markers.items()})
+
+labels = {}
+for i, k in enumerate(model.columns):
+    best = score.loc[k].idxmax()
+    labels[i] = best if score.loc[k, best] > 0.3 else "mixed"
+
+rows = []
+for i, k in enumerate(model.columns):
+    top = (within[k] * share[k]).sort_values(ascending=False).head(6).index.tolist()
+    rows.append({"topic": k, "share of transcripts": f"{model[k].sum() / model.values.sum():.1%}",
+                 "marker-based label": labels[i], "top genes": ", ".join(top)})
+pd.DataFrame(rows).style.hide(axis="index")
+```
+
+```{python}
+top_per_topic = {k: (within[k] * share[k]).sort_values(ascending=False).head(6).index for k in model.columns}
+genes_order = list(dict.fromkeys(g for k in model.columns for g in top_per_topic[k]))
+mat = share.loc[genes_order].T.values
+
+fig, ax = plt.subplots(figsize=(11, 3.8))
+im = ax.imshow(mat, aspect="auto", cmap="viridis", vmin=0, vmax=1)
+ax.set_xticks(range(len(genes_order))); ax.set_xticklabels(genes_order, rotation=90, fontsize=7)
+ax.set_yticks(range(K)); ax.set_yticklabels([f"{k}: {labels[i]}" for i, k in enumerate(model.columns)], fontsize=8)
+fig.colorbar(im, ax=ax, fraction=.02, label="fraction of gene's transcripts in topic")
+ax.set_title("Top genes per topic")
+fig.tight_layout()
+```
+
+## 7. Factors in space
+
+First the H&E-free reference: the DAPI nuclear stain (`morphology_focus`, a coarse
+pyramid level) next to the factor map, with each hexagon coloured by its most
+probable topic.
+
+```{python}
+level = sdata.images["morphology_focus"]["scale4"]["image"]
+dapi = np.asarray(level.squeeze())
+fac = width_px / dapi.shape[1]
+extent = [0, dapi.shape[1] * fac * um_per_px, dapi.shape[0] * fac * um_per_px, 0]
+
+top = res[[str(k) for k in range(K)]].values.argmax(axis=1)
+palette = plt.get_cmap("tab20")(np.arange(K))
+
+fig, axs = plt.subplots(1, 2, figsize=(15, 5.6))
+axs[0].imshow(dapi, extent=extent, cmap="gray", vmax=np.percentile(dapi, 99.5))
+axs[0].set_title("DAPI (morphology_focus, coarse level)")
+axs[1].scatter(res.x, res.y, c=palette[top], s=1.6, marker="s", linewidths=0, rasterized=True)
+axs[1].set_title("Most probable topic per hexagon")
+for a in axs:
+    a.set_aspect("equal"); a.set_xlim(0, extent[1]); a.set_ylim(extent[2], 0)
+    a.set_xlabel("x (um)")
+handles = [plt.Line2D([], [], marker="s", ls="", color=palette[k], label=f"{k}: {labels[k]}") for k in range(K)]
+axs[1].legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, .5), fontsize=8, frameon=False)
+fig.tight_layout()
+```
+
+The tissue separates into tumour epithelium, stromal and immune compartments that
+follow the nuclear-stain architecture. To see each factor on its own, here is the
+per-hexagon probability of every topic:
+
+```{python}
+fig, axs = plt.subplots(3, 4, figsize=(15, 9.6), sharex=True, sharey=True)
+for k, ax in zip(range(K), axs.ravel()):
+    ax.scatter(res.x, res.y, c=res[str(k)], s=.6, marker="s", linewidths=0,
+               cmap="viridis", vmin=0, vmax=1, rasterized=True)
+    ax.set_title(f"{k}: {labels[k]}", fontsize=9)
+    ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+axs[0, 0].set_xlim(0, extent[1]); axs[0, 0].set_ylim(extent[2], 0)
+fig.tight_layout()
+```
+
+### Spatial coherence check
+
+If the factors reflect real tissue structure, neighbouring hexagons should
+share a top topic far more often than chance (single 12 um hexagons are noisy, so well below 100%). As a reference, the same statistic after randomly
+permuting the topic labels:
+
+```{python}
+from scipy.spatial import cKDTree
+
+xy = res[["x", "y"]].values
+_, nbr = cKDTree(xy).query(xy, k=7)          # self + 6 neighbours on a hex lattice
+agree = (top[nbr[:, 1:]] == top[:, None]).mean()
+rng = np.random.default_rng(0)
+perm = rng.permutation(top)
+agree_perm = (perm[nbr[:, 1:]] == perm[:, None]).mean()
+print(f"neighbours sharing the top topic: {agree:.1%}  (permuted labels: {agree_perm:.1%})")
+assert agree > 0.4 and agree > 2 * agree_perm
+```
+
+## Summary
+
+```{python}
+pd.DataFrame({
+    "stage": ["SpatialData read", "export (intrinsic um, qv >= 20)", "pts2tiles", "tiles2hex", "topic-model", "spatial coherence"],
+    "result": [f"{len(pts):,} transcripts, zarr v3 store",
+               f"{n_kept:,} transcripts written",
+               f"{len(feat)} features, {(~is_ctrl).sum()} genes",
+               f"{len(hexdf):,} hexagons at 12 um",
+               f"{K} topics; labels from marker genes",
+               f"{agree:.0%} of neighbours share a top topic (permuted: {agree_perm:.0%})"],
+}).style.hide(axis="index")
+```

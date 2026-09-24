@@ -154,6 +154,7 @@ Notes:
 
 - `--points-key` is the name of the `Points` element in `sdata.points` (e.g. `"transcripts"`).
 - `--coordinate-system` selects which of the element's registered coordinate systems to materialize coordinates in (SpatialData elements can be aligned into more than one). If the element is registered in only one coordinate system, this can be omitted.
+- **Xenium:** `spatialdata-io` stores transcripts in microns but registers them in `global` (image pixels) through a scale transform. Pass `--coordinate-system intrinsic` to export the stored micron coordinates unchanged (the script warns when the chosen system applies a non-identity transform). Add `--min-qv 20` to apply the standard quality filter, and exclude control probes (`antisense_*`, `NegControl*`, `BLANK_*`, `UnassignedCodeword*`) downstream, e.g. with `topic-model --exclude-feature-regex`. Stores written by recent spatialdata (zarr v3) need `spatialdata >= 0.7` to read.
 - The gene/feature column is inferred from the element's `feature_key` metadata; override with `--feature-column` if needed.
 - By default each row is treated as one molecule (no count column); pass `--count-column` if your points table already has a per-row count.
 - Output is streamed partition-by-partition from the underlying Dask dataframe, so it does not require materializing the whole points table in memory.

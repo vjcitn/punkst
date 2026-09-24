@@ -40,9 +40,11 @@ def convert(
     count_column=None,
     z_column=None,
     digits=4,
+    min_qv=None,
+    qv_column="qv",
 ):
     import spatialdata as sd
-    from spatialdata.transformations import get_transformation
+    from spatialdata.transformations import Identity, get_transformation
 
     sdata = sd.read_zarr(sdata_path)
     if points_key not in sdata.points:
@@ -54,7 +56,10 @@ def convert(
     # Resolve which coordinate system to materialize coordinates in. Default
     # to whatever single coordinate system the element is registered under;
     # if there are several (e.g. the element has been aligned into more than
-    # one shared coordinate system), the caller must disambiguate.
+    # one shared coordinate system), the caller must disambiguate. The special
+    # value "intrinsic" exports the element's own stored coordinates without
+    # applying any transformation (for Xenium these are microns, while the
+    # registered "global" system is image pixels).
     transformations = get_transformation(points, get_all=True)
     if coordinate_system is None:
         if len(transformations) != 1:
@@ -63,7 +68,22 @@ def convert(
                 f"({list(transformations)}); pass --coordinate-system to pick one."
             )
         coordinate_system = next(iter(transformations))
-    points = sd.transform(points, to_coordinate_system=coordinate_system)
+    if coordinate_system in transformations:
+        t = transformations[coordinate_system]
+        if not isinstance(t, Identity):
+            print(
+                f"WARNING: exporting in coordinate system '{coordinate_system}', "
+                f"which applies {t!r} to the stored coordinates. punkst expects "
+                "microns; use --coordinate-system intrinsic to export the stored "
+                "coordinates unchanged.",
+                file=sys.stderr,
+            )
+        points = sd.transform(points, to_coordinate_system=coordinate_system)
+    elif coordinate_system != "intrinsic":
+        raise ValueError(
+            f"Unknown coordinate system '{coordinate_system}'; the element is "
+            f"registered in {list(transformations)} (or use 'intrinsic')."
+        )
 
     attrs = points.attrs.get("spatialdata_attrs", {})
     if feature_column is None:
@@ -87,17 +107,18 @@ def convert(
 
     fmt = f"%.{digits}f"
 
+    read_columns = columns + ([qv_column] if min_qv is not None else [])
+
     out = _open_output(out_path)
     try:
         out.write(header)
-        for partition in points[columns].to_delayed():
+        for partition in points[read_columns].to_delayed():
             df = partition.compute()
+            if min_qv is not None:
+                df = df[df[qv_column] >= min_qv][columns]
             if isinstance(df[feature_column].dtype, pd.CategoricalDtype):
                 df[feature_column] = df[feature_column].astype(str)
-            for col in ("x", "y", z_column):
-                if col:
-                    df[col] = df[col].map(lambda v: fmt % v)
-            df.to_csv(out, sep="\t", header=False, index=False)
+            df.to_csv(out, sep="\t", header=False, index=False, float_format=fmt)
     finally:
         if out is not sys.stdout:
             out.close()
@@ -111,8 +132,16 @@ def main(argv):
     parser.add_argument(
         "--coordinate-system",
         default=None,
-        help="Coordinate system to materialize points in (default: infer if unambiguous)",
+        help="Coordinate system to materialize points in (default: infer if unambiguous); "
+        "'intrinsic' exports the stored coordinates without any transformation",
     )
+    parser.add_argument(
+        "--min-qv",
+        type=float,
+        default=None,
+        help="Drop rows whose quality column is below this value (e.g. 20 for Xenium)",
+    )
+    parser.add_argument("--qv-column", default="qv", help="Quality column used by --min-qv")
     parser.add_argument(
         "--feature-column",
         default=None,
@@ -136,6 +165,8 @@ def main(argv):
         count_column=args.count_column,
         z_column=args.z_column,
         digits=args.digits,
+        min_qv=args.min_qv,
+        qv_column=args.qv_column,
     )
 
 
