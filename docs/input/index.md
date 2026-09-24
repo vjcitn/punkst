@@ -138,6 +138,28 @@ zcat cells.csv.gz \
   | awk -F',' -v OFS="\t" '{printf "%.4f\t%.4f\n", $1,$2;}' > cell_coordinates.tsv
 ```
 
+## SpatialData (zarr)
+
+If your data is stored as a [SpatialData](https://spatialdata.scverse.org/) `.zarr` store (e.g. produced by `spatialdata-io` from Xenium, MERSCOPE, CosMx, or Visium HD raw output), use `ext/py/spatialdata_to_punkst.py` to export a `Points` element to the generic transcript TSV format. This requires the `spatialdata` python package.
+
+```bash
+python punkst/ext/py/spatialdata_to_punkst.py \
+  --sdata /path/to/data.zarr \
+  --points-key transcripts \
+  --coordinate-system global \
+  --out transcripts.tsv
+```
+
+Notes:
+
+- `--points-key` is the name of the `Points` element in `sdata.points` (e.g. `"transcripts"`).
+- `--coordinate-system` selects which of the element's registered coordinate systems to materialize coordinates in (SpatialData elements can be aligned into more than one). If the element is registered in only one coordinate system, this can be omitted.
+- The gene/feature column is inferred from the element's `feature_key` metadata; override with `--feature-column` if needed.
+- By default each row is treated as one molecule (no count column); pass `--count-column` if your points table already has a per-row count.
+- Output is streamed partition-by-partition from the underlying Dask dataframe, so it does not require materializing the whole points table in memory.
+
+The resulting `transcripts.tsv` has a `#`-prefixed header and can be fed directly into [pts2tiles](../modules/pts2tiles.md) with `--skip 1`.
+
 ## 10X Single cell
 
 If you would like to apply topic modeling or matrix factorization to your single cell data, you can convert the 10X Genomics single-cell DGE files to files used by `punkst topic-model` and `nmf-pois-log1p` etc. by the following command:
