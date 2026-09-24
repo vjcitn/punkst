@@ -3,9 +3,11 @@
 ### convert-dge, etc).
 #
 # The output has columns: x, y, feature[, count], preceded by a single
-# "#"-prefixed header line, so it can be read with e.g.
-#   punkst pts2tiles --in-tsv out.tsv --skip 1 --skip-last-is-header \
-#     --icol-x 0 --icol-y 1 --icol-feature 2 --icol-int 3
+# "#"-prefixed header line. pts2tiles auto-detects "#"-prefixed lines as
+# header/metadata, so no --skip is needed:
+#   punkst pts2tiles --in-tsv transcripts.tsv \
+#     --icol-x 0 --icol-y 1 --icol-feature 2 \
+#     --tile-size 500 --out-prefix transcripts.tiled
 
 import sys
 import gzip

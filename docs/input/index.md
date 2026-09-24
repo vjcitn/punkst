@@ -158,7 +158,7 @@ Notes:
 - By default each row is treated as one molecule (no count column); pass `--count-column` if your points table already has a per-row count.
 - Output is streamed partition-by-partition from the underlying Dask dataframe, so it does not require materializing the whole points table in memory.
 
-The resulting `transcripts.tsv` has a `#`-prefixed header and can be fed directly into [pts2tiles](../modules/pts2tiles.md) with `--skip 1`.
+The resulting `transcripts.tsv` has a `#`-prefixed header, which [pts2tiles](../modules/pts2tiles.md) auto-detects and copies through — no `--skip` is needed, just pass it as `--in-tsv`.
 
 ## 10X Single cell
 
