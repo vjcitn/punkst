@@ -1,0 +1,219 @@
+---
+title: "SpatialData → punkst bridge: end-to-end test"
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+jupyter: python3
+execute:
+  warning: false
+---
+
+This notebook runs the same checks as `run_spatialdata_e2e.sh`, stage by stage,
+and shows what each stage produced. It needs the `spatialdata` python package and a
+built `punkst` binary (set the `PUNKST` environment variable, or build to
+`<repo>/bin/punkst`).
+
+## Setup
+
+```{python}
+import os, subprocess, sys, tempfile, warnings
+from pathlib import Path
+
+warnings.filterwarnings("ignore")
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.collections import PatchCollection
+from matplotlib.patches import RegularPolygon
+
+here = Path.cwd()
+sys.path.insert(0, str(here))
+sys.path.insert(0, str(here.parent))
+from make_synthetic_sdata import build, build_structured
+from spatialdata_to_punkst import convert
+
+punkst = Path(os.environ.get("PUNKST", here.parents[2] / "bin" / "punkst"))
+assert punkst.exists(), f"punkst binary not found at {punkst}; set PUNKST"
+work = Path(tempfile.mkdtemp(prefix="punkst_sd_"))
+
+def run(*args):
+    """Run a punkst subcommand, raising with its output on failure."""
+    r = subprocess.run([str(punkst), *map(str, args)], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stdout + r.stderr)
+    return r
+
+print("punkst:", punkst)
+print("work dir:", work)
+```
+
+## 1. Converter: coordinate systems
+
+The small fixture registers its points in two coordinate systems: `pixels`
+(identity) and `microns` (a scale by 2). The converter must apply the chosen
+transform, and must refuse to guess when more than one system is registered.
+
+```{python}
+truth = build(str(work / "synthetic.zarr"), n_points=500, scale=2.0, seed=11)
+
+try:
+    convert(str(work / "synthetic.zarr"), "transcripts", str(work / "amb.tsv"))
+except ValueError as e:
+    print("ambiguous coordinate system correctly rejected:\n ", e)
+
+convert(str(work / "synthetic.zarr"), "transcripts", str(work / "microns.tsv"),
+        coordinate_system="microns")
+convert(str(work / "synthetic.zarr"), "transcripts", str(work / "pixels.tsv"),
+        coordinate_system="pixels")
+
+mic = pd.read_csv(work / "microns.tsv", sep="\t", comment="#", header=None,
+                  names=["x", "y", "feature"])
+pix = pd.read_csv(work / "pixels.tsv", sep="\t", comment="#", header=None,
+                  names=["x", "y", "feature"])
+assert len(mic) == 500
+np.testing.assert_allclose(
+    mic.sort_values(["x", "y"]).x.values / 2,
+    pix.sort_values(["x", "y"]).x.values, atol=1e-3)
+print(open(work / "microns.tsv").readline().rstrip(), "(header)")
+mic.head()
+```
+
+```{python}
+fig, ax = plt.subplots(1, 2, figsize=(8, 3.6), sharex=False)
+for a, d, t in [(ax[0], pix, "pixels (identity)"), (ax[1], mic, "microns (scale 2)")]:
+    a.scatter(d.x, d.y, s=4, alpha=.6)
+    a.set_title(t); a.set_aspect("equal"); a.set_xlabel("x"); a.set_ylabel("y")
+fig.tight_layout()
+```
+
+The same molecules land at twice the coordinates in the `microns` system, so the
+SpatialData transformation is being applied on export.
+
+## 2. Structured fixture
+
+Now a fixture with real structure: the left half of the tissue is enriched for
+the `A*` genes and the right half for the `B*` genes. A 2-topic model should
+recover this.
+
+```{python}
+build_structured(str(work / "structured.zarr"), seed=5)
+convert(str(work / "structured.zarr"), "transcripts", str(work / "st.tsv"))
+st = pd.read_csv(work / "st.tsv", sep="\t", comment="#", header=None,
+                 names=["x", "y", "feature"])
+st["group"] = st.feature.str[0]
+print(f"{len(st):,} molecules, {st.feature.nunique()} genes")
+
+fig, ax = plt.subplots(figsize=(5, 4.6))
+sub = st.sample(15000, random_state=0)
+for g, c in [("A", "tab:red"), ("B", "tab:blue")]:
+    d = sub[sub.group == g]
+    ax.scatter(d.x, d.y, s=1.5, alpha=.5, c=c, label=f"{g}* genes")
+ax.set_aspect("equal"); ax.legend(markerscale=6)
+ax.set_title("Transcripts exported from SpatialData")
+```
+
+## 3. `pts2tiles`
+
+```{python}
+run("pts2tiles", "--in-tsv", work / "st.tsv",
+    "--icol-x", 0, "--icol-y", 1, "--icol-feature", 2,
+    "--tile-size", 100, "--temp-dir", work / "tmp1",
+    "--out-prefix", work / "st.tiled")
+for suffix in ("tsv", "index", "features.tsv"):
+    f = work / f"st.tiled.{suffix}"
+    assert f.stat().st_size > 0
+    print(f"{f.name:22s} {f.stat().st_size:>10,} bytes")
+```
+
+## 4. `tiles2hex`
+
+```{python}
+run("tiles2hex", "--in-tsv", work / "st.tiled.tsv", "--in-index", work / "st.tiled.index",
+    "--feature-dict", work / "st.tiled.features.tsv",
+    "--icol-x", 0, "--icol-y", 1, "--icol-feature", 2,
+    "--hex-grid-dist", 12, "--min-count", 5,
+    "--out", work / "hex.txt", "--randomize", "--seed", 1,
+    "--temp-dir", work / "tmp2")
+hist = pd.read_csv(work / "hex.count_hist.tsv", sep="\t", header=None)
+n_hex = sum(1 for _ in open(work / "hex.txt"))
+print(n_hex, "hexagons")
+hist.head()
+```
+
+## 5. `topic-model`
+
+```{python}
+run("topic-model", "--in-data", work / "hex.txt", "--in-meta", work / "hex.json",
+    "--features", work / "st.tiled.features.tsv",
+    "--n-topics", 2, "--n-epochs", 5, "--min-count-train", 5,
+    "--out-prefix", work / "lda", "--transform", "--threads", 2, "--seed", 1)
+
+model = pd.read_csv(work / "lda.model.tsv", sep="\t", index_col=0)
+frac_a = [model.loc[model.index.str.startswith("A"), k].sum() / model[k].sum()
+          for k in model.columns]
+print("A-gene fraction per topic:", [round(f, 3) for f in frac_a])
+assert max(frac_a) > 0.7 and min(frac_a) < 0.3, "topics did not separate A/B genes"
+```
+
+### Topic–gene loadings
+
+Each column is normalised to a distribution over genes. One topic should
+concentrate on `A*` genes and the other on `B*`.
+
+```{python}
+norm = model / model.sum()
+fig, ax = plt.subplots(figsize=(4.5, 5))
+im = ax.imshow(norm.values, aspect="auto", cmap="viridis")
+ax.set_yticks(range(len(norm))); ax.set_yticklabels(norm.index, fontsize=7)
+ax.set_xticks(range(norm.shape[1])); ax.set_xticklabels([f"topic {k}" for k in norm.columns])
+fig.colorbar(im, ax=ax, label="P(gene | topic)")
+fig.tight_layout()
+```
+
+### Topics in space
+
+Each hexagon is coloured by its probability of the topic that loads on `A*`
+genes. It should split the tissue at x = 100, matching how the data were
+generated.
+
+```{python}
+res = pd.read_csv(work / "lda.results.tsv", sep="\t")
+res = res.rename(columns={"#random_key": "key"})
+a_topic = str(int(np.argmax(frac_a)))
+hex_dist = 12
+side = hex_dist / np.sqrt(3)  # side length of a hexagon with this center spacing
+
+fig, axs = plt.subplots(1, 2, figsize=(9.5, 4.4))
+for ax, col, title in [(axs[0], a_topic, f"P(topic {a_topic})  [A*-dominated]"),
+                       (axs[1], None, "Top topic")]:
+    patches = [RegularPolygon((x, y), 6, radius=side, orientation=0)
+               for x, y in zip(res.x, res.y)]
+    pc = PatchCollection(patches, edgecolor="none")
+    if col is not None:
+        pc.set_array(res[col].values); pc.set_cmap("coolwarm"); pc.set_clim(0, 1)
+    else:
+        pc.set_array(res[["0", "1"]].values.argmax(axis=1)); pc.set_cmap("tab10"); pc.set_clim(0, 9)
+    ax.add_collection(pc)
+    ax.set_xlim(0, 200); ax.set_ylim(0, 200); ax.set_aspect("equal"); ax.set_title(title)
+    if col is not None:
+        fig.colorbar(pc, ax=ax, fraction=.046)
+fig.tight_layout()
+
+left = res[res.x < 90]; right = res[res.x > 110]
+print(f"mean P(topic {a_topic}): left half {left[a_topic].mean():.2f}, right half {right[a_topic].mean():.2f}")
+assert left[a_topic].mean() > 0.8 and right[a_topic].mean() < 0.2
+```
+
+## Summary
+
+```{python}
+pd.DataFrame({
+    "stage": ["converter (coordinate systems)", "pts2tiles", "tiles2hex", "topic-model"],
+    "result": ["microns = 2 x pixels; ambiguity rejected",
+               "tiled tsv + index written",
+               f"{n_hex} hexagons",
+               f"topics separate A/B genes (A-fraction {min(frac_a):.2f} / {max(frac_a):.2f})"],
+}).style.hide(axis="index")
+```
