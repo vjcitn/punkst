@@ -119,6 +119,34 @@ Install dependencies with your system package manager when possible:
 | libpng | `sudo apt-get install libpng-dev` | `sudo yum install libpng-devel` | `brew install libpng` |
 | libcurl | `sudo apt-get install libcurl4-openssl-dev` | `sudo yum install libcurl-devel` | `brew install curl` |
 
+### Minimal Build Without a Package Manager
+
+This recipe builds `punkst` without installing TBB, libpng or libcurl. It was used on macOS (Apple Clang) without Homebrew, and is a reasonable starting point when you cannot or prefer not to install system packages. It needs only Git, CMake >= 3.15, a C++17 compiler, and the system zlib, BZip2 and LibLZMA libraries.
+
+```bash
+git clone https://github.com/your-org/punkst.git
+cd punkst
+git submodule update --init ext/eigen ext/faiss ext/clipper2
+
+mkdir -p build && cd build
+cmake .. \
+  -DFETCH_TBB=ON \
+  -DENABLE_IMAGE_OUTPUT=OFF \
+  -DENABLE_REMOTE_IO=OFF \
+  -DENABLE_NATIVE_ARCH=OFF
+cmake --build . --parallel
+../bin/punkst --help
+```
+
+What the options do:
+
+- `FETCH_TBB=ON` downloads and builds oneTBB during the build (slower, but needs no installed TBB).
+- `ENABLE_IMAGE_OUTPUT=OFF` removes the PNG output commands, so libpng is not needed.
+- `ENABLE_REMOTE_IO=OFF` disables `http(s)` and `s3://` inputs, so libcurl is not needed. Local files work as usual.
+- `ENABLE_NATIVE_ARCH=OFF` avoids `-march=native`, so the binary runs on other machines with the same architecture.
+
+If `cmake` is not on your `PATH`, call it by its full path (for example the `CMake.app/Contents/bin/cmake` bundled with a CMake macOS install). If OpenMP is not found, the configure step reports that Faiss is skipped; the pipelines used in the SpatialData workflow (`pts2tiles`, `tiles2hex`, `topic-model`) do not depend on it in our runs.
+
 ### Rootless Installs
 
 If dependencies are installed under a user prefix, pass that prefix to CMake:
