@@ -187,7 +187,7 @@ if not (work / "h12.k12.results.tsv").exists():
         "--threads", threads, "--seed", 1)
 
 model = pd.read_csv(work / "h12.k12.model.tsv", sep="\t", index_col=0)
-res = pd.read_csv(work / "h12.k12.results.tsv", sep="\t").rename(columns={"#random_key": "key"})
+res = pd.read_csv(work / "h12.k12.results.tsv", sep="\t", dtype={"#random_key": str}).rename(columns={"#random_key": "key"})
 K = model.shape[1]
 print(f"model: {model.shape[0]} genes x {K} topics; results: {len(res):,} hexagons")
 assert K == 12 and len(res) > 100_000
@@ -304,6 +304,226 @@ agree_perm = (perm[nbr[:, 1:]] == perm[:, None]).mean()
 print(f"neighbours sharing the top topic: {agree:.1%}  (permuted labels: {agree_perm:.1%})")
 assert agree > 0.4 and agree > 2 * agree_perm
 ```
+
+## Reanalysis with an external marker mapping
+
+The marker sets used above to name topics were written by hand after looking at
+the topics, so they are not an independent check. Here we repeat the annotation
+with a fixed, pre-specified mapping of 13 breast tissue compartments, defined
+before looking at this dataset's topics. Not every gene is on the Xenium panel,
+so we first report coverage.
+
+```{python}
+ref_markers = {
+    "epithelium (luminal/tumor)": ["EPCAM", "KRT8", "KRT18", "KRT19", "KRT7", "CDH1", "FOXA1"],
+    "fibroblast":        ["DCN", "LUM", "COL1A1", "COL1A2", "FBLN1", "PDGFRA"],
+    "pericyte/vSMC":     ["RGS5", "NOTCH3", "MYH11", "MCAM", "PDGFRB"],
+    "myoepithelial":     ["KRT5", "KRT14", "KRT17", "TP63", "OXTR"],
+    "T cell":            ["CD3E", "CD3D", "CD3G", "TRAC", "CD247"],
+    "NK":                ["NKG7", "GNLY", "KLRD1"],
+    "macrophage":        ["C1QA", "C1QB", "CD163", "CD68", "CSF1R", "MRC1"],
+    "dendritic":         ["CLEC9A", "LAMP3", "CD1C"],
+    "mast":              ["TPSAB1", "CPA3", "KIT"],
+    "B cell":            ["MS4A1", "CD79A", "CD79B", "CD19"],
+    "plasma":            ["MZB1", "JCHAIN", "XBP1", "IGKC"],
+    "endothelial":       ["PECAM1", "VWF", "CDH5", "PLVAP", "CLEC14A", "KDR"],
+    "adipocyte":         ["ADIPOQ", "PLIN1", "LEP"],
+}
+panel = set(feat.feature[~is_ctrl])
+ref_present = {c: [g for g in gs if g in panel] for c, gs in ref_markers.items()}
+cov = pd.DataFrame({
+    "on panel": [f"{len(ref_present[c])}/{len(ref_markers[c])}" for c in ref_markers],
+    "missing": [", ".join(g for g in ref_markers[c] if g not in panel) or "-" for c in ref_markers],
+}, index=list(ref_markers))
+print(f"{sum(map(len, ref_present.values()))} of {sum(map(len, ref_markers.values()))} genes are on the panel")
+cov
+```
+
+### Topic-level scores
+
+For each topic and compartment we average, over the compartment's on-panel genes,
+the log2 enrichment of the gene in the topic: the fraction of the gene's
+transcripts assigned to the topic divided by the topic's overall share. A value of
+1 means the marker is twice as concentrated in that topic as expected by chance.
+A topic is assigned to a compartment when its best score exceeds 1.
+
+```{python}
+topic_frac = model.sum() / model.values.sum()
+enr = np.log2((share + 1e-3).div(topic_frac, axis=1))
+ref_score = pd.DataFrame({c: enr.loc[gs].mean() for c, gs in ref_present.items()})
+ref_score.index = range(K)
+
+ref_labels = {}
+for k in range(K):
+    best = ref_score.loc[k].idxmax()
+    ref_labels[k] = best if ref_score.loc[k, best] > 1 else "unassigned"
+
+fig, ax = plt.subplots(figsize=(10, 4.6))
+im = ax.imshow(ref_score.values, aspect="auto", cmap="RdBu_r", vmin=-3, vmax=3)
+ax.set_xticks(range(ref_score.shape[1])); ax.set_xticklabels(ref_score.columns, rotation=60, ha="right", fontsize=8)
+ax.set_yticks(range(K)); ax.set_yticklabels([f"{k}: {ref_labels[k]}" for k in range(K)], fontsize=8)
+fig.colorbar(im, ax=ax, fraction=.03, label="mean log2 enrichment of markers")
+ax.set_title("Topic x compartment marker enrichment (pre-specified mapping)")
+fig.tight_layout()
+
+pd.DataFrame({
+    "topic": range(K),
+    "hand-picked label": [labels[k] for k in range(K)],
+    "pre-specified label": [ref_labels[k] for k in range(K)],
+    "best score": [round(ref_score.loc[k].max(), 2) for k in range(K)],
+}).style.hide(axis="index")
+```
+
+### Hexagon-level check that does not use the topic model
+
+To check the assignment against the raw counts rather than the fitted topics, we
+load the hexagon x gene counts, weight each gene by its inverse total count so
+abundant genes do not dominate, and give each hexagon the compartment with the
+highest mean marker signal. This is compared with the compartment assigned to the
+hexagon's most probable topic.
+
+```{python}
+import json
+import scipy.sparse as sp
+
+dictionary = json.load(open(work / "hex_12.json"))["dictionary"]
+keys, r_, c_, v_ = [], [], [], []
+with open(work / "hex_12.txt") as fh:
+    for i, line in enumerate(fh):
+        f = line.rstrip("\n").split("\t")
+        keys.append(f[0])
+        for pair in f[5:]:
+            j, cnt = pair.split(" ")
+            r_.append(i); c_.append(int(j)); v_.append(int(cnt))
+X = sp.csr_matrix((v_, (r_, c_)), shape=(len(keys), len(dictionary)))
+gene_tot = np.asarray(X.sum(axis=0)).ravel()
+hexdf["key"] = keys
+print(f"hexagon x gene matrix: {X.shape}, {X.nnz:,} nonzeros")
+
+Xw = X @ sp.diags(1.0 / np.maximum(gene_tot, 1))
+comp_names = list(ref_present)
+comp_sig = np.column_stack([
+    np.asarray(Xw[:, [dictionary[g] for g in ref_present[c]]].mean(axis=1)).ravel()
+    for c in comp_names])
+comp_sig = comp_sig / comp_sig.sum(axis=0, keepdims=True)    # comparable across compartments
+direct = pd.Series(np.array(comp_names)[comp_sig.argmax(axis=1)])
+direct[comp_sig.sum(axis=1) == 0] = "none"
+
+# hexagons are matched on their (x, y) centre; the random keys are not unique
+def xy_key(x, y):
+    return pd.Series(list(zip(np.round(np.asarray(x) * 1000).astype(int),
+                              np.round(np.asarray(y) * 1000).astype(int))))
+hex_pos = pd.Series(np.arange(len(hexdf)), index=pd.MultiIndex.from_tuples(xy_key(hexdf.x, hexdf.y)))
+assert hex_pos.index.is_unique
+ridx = hex_pos.reindex(pd.MultiIndex.from_tuples(xy_key(res.x, res.y))).values
+assert not np.isnan(ridx).any(), "results hexagons not found in hex_12.txt"
+ridx = ridx.astype(int)                      # results row -> row of X / hexdf
+
+topic_label = np.array([ref_labels[t] for t in top])
+direct_r = direct.values[ridx]
+ok = (topic_label != "unassigned") & (direct_r != "none")
+tl, dl = topic_label[ok], direct_r[ok]
+agree_ref = (tl == dl).mean()
+agree_shuf = (np.random.default_rng(0).permutation(tl) == dl).mean()
+print(f"{ok.sum():,} hexagons compared; direct marker call matches topic-derived label for "
+      f"{agree_ref:.1%} (shuffled: {agree_shuf:.1%})")
+
+cm = pd.crosstab(tl, dl)
+cm = cm.div(cm.sum(axis=1), axis=0)
+fig, ax = plt.subplots(figsize=(10, 4))
+im = ax.imshow(cm.values, aspect="auto", cmap="viridis", vmin=0, vmax=1)
+ax.set_xticks(range(cm.shape[1])); ax.set_xticklabels(cm.columns, rotation=60, ha="right", fontsize=8)
+ax.set_yticks(range(cm.shape[0])); ax.set_yticklabels(cm.index, fontsize=8)
+ax.set_xlabel("compartment from raw marker counts"); ax.set_ylabel("compartment from top topic")
+fig.colorbar(im, ax=ax, fraction=.03, label="row fraction")
+fig.tight_layout()
+```
+
+### Map of the pre-specified annotation
+
+```{python}
+uniq = sorted(set(ref_labels.values()))
+pal2 = dict(zip(uniq, plt.get_cmap("tab20")(np.arange(len(uniq)))))
+pal2["unassigned"] = (.8, .8, .8, 1)
+colors = np.array([pal2[ref_labels[t]] for t in top])
+
+fig, ax = plt.subplots(figsize=(10, 6.8))
+ax.scatter(res.x, res.y, c=colors, s=1.6, marker="s", linewidths=0, rasterized=True)
+ax.set_aspect("equal"); ax.set_xlim(0, extent[1]); ax.set_ylim(extent[2], 0)
+ax.set_xlabel("x (um)"); ax.set_ylabel("y (um)")
+ax.set_title("Hexagons coloured by the pre-specified compartment of their top topic")
+ax.legend(handles=[plt.Line2D([], [], marker="s", ls="", color=pal2[u], label=u) for u in uniq],
+          loc="center left", bbox_to_anchor=(1.01, .5), fontsize=8, frameon=False)
+fig.tight_layout()
+```
+
+**Reading the result.** The pre-specified mapping agrees with the hand-picked
+labels for the compartments with several on-panel markers and a distinct
+signature (T cell, B cell, endothelial, myoepithelial, fibroblast). It does not
+reproduce the tumor labels: the main tumor topic scores just below the
+assignment threshold and other tumor-rich topics receive low-support labels such
+as plasma, mast or adipocyte, each resting on one to three low-count genes
+(plasma has only MZB1 on the panel). The hexagon-level agreement with raw marker
+counts is well above a shuffled baseline but low in absolute terms. In a tumor
+dominated section, with 41 of 60 markers on a 313-gene panel, this mapping is
+better suited to the immune, vascular and stromal compartments than to separating
+tumor from normal epithelium, and its labels for small, weakly supported
+compartments should not be over-interpreted. A reference-based method with
+cell-level reference profiles would be the stronger test.
+
+## Tumor markers in space
+
+The panel includes the HER2 gene `ERBB2`, the hormone receptors `ESR1` and `PGR`,
+the luminal-lineage genes `FOXA1` and `GATA3`, the proliferation marker `MKI67`,
+and the basal keratin `KRT5`. `GRB7` (usually co-amplified with `ERBB2`) is not on
+the panel, so HER2-axis evidence rests on `ERBB2` alone. Expression here is
+transcripts per 1,000 transcripts in each 12 um hexagon.
+
+```{python}
+tumor_genes = ["ERBB2", "ESR1", "PGR", "FOXA1", "GATA3", "MKI67", "KRT5"]
+print("not on panel:", [g for g in ["GRB7"] if g not in dictionary])
+tot = np.asarray(X.sum(axis=1)).ravel()
+rate = {g: np.asarray(X[:, dictionary[g]].todense()).ravel() / np.maximum(tot, 1) * 1000
+        for g in tumor_genes}
+tab = pd.DataFrame({
+    "transcripts": [int(X[:, dictionary[g]].sum()) for g in tumor_genes],
+    "% hexagons with >=1": [100 * (rate[g] > 0).mean() for g in tumor_genes],
+    "99th pct rate / 1000": [np.percentile(rate[g], 99) for g in tumor_genes],
+}, index=tumor_genes).round(2)
+tab
+```
+
+```{python}
+fig, axs = plt.subplots(2, 4, figsize=(17, 8.2), sharex=True, sharey=True)
+for g, ax in zip(tumor_genes, axs.ravel()):
+    v = rate[g]
+    order = np.argsort(v)                      # draw high-expressing hexagons last
+    vmax = max(np.percentile(v[v > 0], 99), 1e-9) if (v > 0).any() else 1
+    sc = ax.scatter(hexdf.x.values[order], hexdf.y.values[order], c=v[order], s=.9,
+                    marker="s", linewidths=0, cmap="inferno", vmin=0, vmax=vmax, rasterized=True)
+    ax.set_title(g); ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+    ax.set_facecolor("#111")
+    fig.colorbar(sc, ax=ax, fraction=.04, pad=.01)
+axs.ravel()[-1].axis("off")
+axs[0, 0].set_xlim(0, extent[1]); axs[0, 0].set_ylim(extent[2], 0)
+fig.tight_layout()
+```
+
+Do the tumor genes sit where the epithelial topics are? Mean rate by the
+pre-specified compartment of each hexagon's top topic:
+
+```{python}
+by = pd.DataFrame({g: rate[g][ridx] for g in tumor_genes})
+by["compartment"] = topic_label
+summary_tab = by.groupby("compartment")[tumor_genes].mean().round(2)
+summary_tab["hexagons"] = by.groupby("compartment").size()
+summary_tab
+```
+
+Receptor status is a clinical determination from IHC or ISH on pathology and
+cannot be called from this panel. Low `ESR1`/`PGR` counts in particular are not
+evidence of receptor negativity, because these genes are often weakly detected by
+Xenium. These maps show where the transcripts are, not a clinical subtype.
 
 ## Summary
 
